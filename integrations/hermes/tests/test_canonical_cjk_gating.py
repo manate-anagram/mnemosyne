@@ -18,9 +18,15 @@ These tests pin the 2-gram behaviour on the public canonical paths:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from mnemosyne_hermes import _canonical_prefetch_rows, _canonical_recall_rows
+from mnemosyne_hermes import (
+    MnemosyneMemoryProvider,
+    _canonical_prefetch_rows,
+    _canonical_recall_rows,
+)
 
 JAPANESE = {
     "slots": [
@@ -209,6 +215,162 @@ def test_cjk_stop_units_are_operator_configurable(monkeypatch):
     monkeypatch.setenv("MNEMOSYNE_PREFETCH_CJK_STOP_UNITS", "什么,么时,时候,部署")
 
     assert _canonical_recall_rows(_store("zh"), "default", "什么时候部署？") == []
+
+
+class FakeBeam:
+    """Beam stub for the public paths: recall results plus a canonical store."""
+
+    author_id = "test-author"
+
+    def __init__(self, canonical=None, results=None):
+        self.canonical = canonical
+        self.results = results or []
+        self.writes = []
+
+    def recall(self, *args, **kwargs):  # noqa: ARG002 - provider passes through
+        self.last_kwargs = kwargs
+        return self.results
+
+    def remember(self, **kwargs):
+        self.writes.append(kwargs)
+
+
+class OwnerScopedCanonicalStore:
+    """Canonical store that honours ``list(owner_id)`` scoping."""
+
+    def __init__(self, rows_by_owner):
+        self._rows_by_owner = rows_by_owner
+        self.requested_owner_ids = []
+
+    def list(self, owner_id):
+        self.requested_owner_ids.append(owner_id)
+        return self._rows_by_owner.get(owner_id, [])
+
+
+def _provider(canonical=None, results=None, identity=None):
+    provider = MnemosyneMemoryProvider()
+    provider._beam = FakeBeam(canonical, results)
+    provider._agent_context = "primary"
+    if identity is not None:
+        provider._agent_identity = identity
+    return provider
+
+
+def _working_row(content, source="preference"):
+    return {
+        "content": content,
+        "source": source,
+        "timestamp": "2026-09-01T00:00:00Z",
+        "importance": 0.9,
+        "score": 0.8,
+        "keyword_score": 0.8,
+        "trust_tier": "STATED",
+    }
+
+
+UNRELATED_QUERY = "会議室の予約ルールはどこにある？"
+RELATED_QUERY = "静かな喫茶店を探している"
+ORDINARY_MEMORY = "会議室の予約ルールは総務が管理していて、変更は申請が必要。"
+
+
+def test_prefetch_public_path_keeps_ordinary_results_and_drops_unrelated_canonical_rows():
+    """The per-turn injection path must not let unrelated slots displace recall.
+
+    This is the user-visible half of #971: automatic prefetch appends canonical
+    rows to ordinary results, so character-level noise put unrelated
+    single-source-of-truth facts ahead of the memory that actually matched.
+    """
+
+    provider = _provider(canonical=_store("ja"), results=[_working_row(ORDINARY_MEMORY)])
+
+    block = provider.prefetch(UNRELATED_QUERY)
+
+    assert "総務" in block, "the ordinary matching memory must still be injected"
+    for _, _, body in FIXTURES["ja"]["slots"]:
+        assert body not in block, f"unrelated canonical slot injected: {body}"
+
+
+def test_prefetch_public_path_injects_the_matching_canonical_row():
+    provider = _provider(canonical=_store("ja"))
+
+    block = provider.prefetch(RELATED_QUERY)
+
+    assert FIXTURES["ja"]["slots"][1][2] in block
+
+
+def test_recall_tool_path_keeps_ordinary_results_and_drops_unrelated_canonical_rows():
+    """mnemosyne_recall merges canonical rows into normal recall results."""
+
+    provider = _provider(canonical=_store("ja"), results=[_working_row(ORDINARY_MEMORY)])
+
+    payload = json.loads(provider._handle_recall({"query": UNRELATED_QUERY}))
+
+    contents = [row.get("content") for row in payload["results"]]
+    assert ORDINARY_MEMORY in contents
+    for _, name, body in FIXTURES["ja"]["slots"]:
+        assert body not in contents, f"unrelated canonical slot merged: {name}"
+
+
+def test_recall_tool_path_merges_the_matching_canonical_row():
+    provider = _provider(canonical=_store("ja"))
+
+    payload = json.loads(provider._handle_recall({"query": RELATED_QUERY}))
+
+    assert FIXTURES["ja"]["slots"][1][2] in [row.get("content") for row in payload["results"]]
+
+
+@pytest.mark.parametrize("path_name,path", CANONICAL_PATHS, ids=CANONICAL_PATH_IDS)
+def test_canonical_matching_stays_owner_scoped(path_name, path):
+    """Rows stored for another owner must not match, in either path."""
+
+    store = OwnerScopedCanonicalStore({
+        "other-profile": [
+            {
+                "body": FIXTURES["ja"]["slots"][1][2],
+                "category": "preference",
+                "name": "tea",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+    })
+
+    assert list(path(store, "default", RELATED_QUERY)) == []
+    assert store.requested_owner_ids == ["default"]
+
+
+def test_prefetch_public_path_stays_owner_scoped():
+    provider = _provider(
+        canonical=OwnerScopedCanonicalStore({
+            "other-profile": [
+                {
+                    "body": FIXTURES["ja"]["slots"][1][2],
+                    "category": "preference",
+                    "name": "tea",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+        }),
+        identity="default",
+    )
+
+    assert FIXTURES["ja"]["slots"][1][2] not in provider.prefetch(RELATED_QUERY)
+
+
+@pytest.mark.parametrize("path_name,path", CANONICAL_PATHS, ids=CANONICAL_PATH_IDS)
+def test_cyrillic_canonical_matching_is_unchanged(path_name, path):
+    """Non-CJK scripts keep the pre-#971 word-token behaviour."""
+
+    store = FakeCanonicalStore([
+        {
+            "body": "Пользователь предпочитает тёмную резервную копию.",
+            "category": "preference",
+            "name": "backup_style",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+    ])
+
+    assert [row.get("canonical_name") for row in path(store, "default", "Найди тёмную резервную копию")] == ["backup_style"]
+
 
 
 @pytest.mark.parametrize("path_name,path", CANONICAL_PATHS, ids=CANONICAL_PATH_IDS)
