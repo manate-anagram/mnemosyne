@@ -373,6 +373,25 @@ def test_cyrillic_canonical_matching_is_unchanged(path_name, path):
 
 
 
+def test_identical_cjk_span_does_not_bypass_the_stop_unit_filter(monkeypatch):
+    """A shared run must not match through the raw word token.
+
+    _PREFETCH_TOKEN_RE uses Unicode ``\w``, so before this was masked the whole
+    CJK run also arrived as one word token and an identical query/row pair
+    matched even when every 2-gram of that run was configured as a stop unit.
+    """
+
+    monkeypatch.setenv("MNEMOSYNE_PREFETCH_CJK_STOP_UNITS", "状況,況確,確認")
+    body = "状況確認"
+
+    store = FakeCanonicalStore([
+        {"body": body, "category": "procedure", "name": "status_check", "created_at": "2026-01-01T00:00:00Z"}
+    ])
+
+    for path_name, path in CANONICAL_PATHS:
+        assert path(store, "default", body) == [], f"{path_name} matched a fully filtered run"
+
+
 @pytest.mark.parametrize("path_name,path", CANONICAL_PATHS, ids=CANONICAL_PATH_IDS)
 def test_latin_canonical_matching_is_unchanged(path_name, path):
     """Latin words keep their pre-#971 behaviour: two shared words still match."""

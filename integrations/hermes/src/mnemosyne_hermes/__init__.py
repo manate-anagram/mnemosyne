@@ -479,7 +479,11 @@ def _prefetch_lexical_units(content: str) -> Set[str]:
             unit for unit in (run[i:i + 2] for i in range(len(run) - 1))
             if unit not in stop_units
         )
-    units |= _prefetch_word_tokens(c)
+    # Word tokens come from the non-CJK remainder only. _PREFETCH_TOKEN_RE uses
+    # Unicode \\w, so an unread run would also arrive as one whole-run token that
+    # bypasses the stop-unit filter whenever a query and a row share an
+    # identical span (review: coderabbitai on #975).
+    units |= _prefetch_word_tokens(_PREFETCH_CJK_UNIT_RE.sub(" ", c))
     return units
 
 
