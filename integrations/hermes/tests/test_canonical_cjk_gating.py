@@ -26,6 +26,9 @@ from mnemosyne_hermes import (
     MnemosyneMemoryProvider,
     _canonical_prefetch_rows,
     _canonical_recall_rows,
+    _prefetch_lexical_units,
+    _prefetch_tokens,
+    _semantic_dedup_prefetch,
 )
 
 JAPANESE = {
@@ -415,3 +418,72 @@ def test_latin_canonical_matching_is_unchanged(path_name, path):
 
     assert "bakery" in names
     assert "workflow" not in names
+
+
+# --- dedup boundary ------------------------------------------------------------------
+# Review (coderabbitai on #975): the dedup step compared per-character tokens, so two
+# rows that merely shared characters were treated as duplicates and one of them was
+# dropped before injection / before the recall result list was returned.
+
+
+def _shared_character_store():
+    return FakeCanonicalStore([
+        {
+            "body": SHARED_TEXT,
+            "category": "fact",
+            "name": "meeting_room",
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+    ])
+
+
+SHARED_TEXT = "会議室の予約ルール"
+SPACED_TEXT = "会 議 室 の 予 約 ル ー ル"
+
+
+def test_dedup_keeps_rows_that_only_share_characters():
+    """Character overlap is not lexical overlap: 2-grams vs single characters."""
+
+    shared = _prefetch_tokens(SHARED_TEXT) & _prefetch_tokens(SPACED_TEXT)
+    assert len(shared) == 8, f"fixture no longer reproduces the old collision: {shared}"
+    assert not (_prefetch_lexical_units(SHARED_TEXT) & _prefetch_lexical_units(SPACED_TEXT))
+
+    kept = _semantic_dedup_prefetch([{"content": SHARED_TEXT}, {"content": SPACED_TEXT}])
+
+    assert [row["content"] for row in kept] == [SHARED_TEXT, SPACED_TEXT]
+
+
+def test_dedup_still_collapses_true_duplicates():
+    kept = _semantic_dedup_prefetch([
+        {"content": "会議室の予約ルールは総務が管理している。"},
+        {"content": "会議室の予約ルールは総務が管理している"},
+    ])
+
+    assert len(kept) == 1
+
+
+def test_dedup_keeps_a_row_whose_units_are_all_function_words():
+    """A row with no topical unit must survive instead of losing its signature."""
+
+    kept = _semantic_dedup_prefetch([{"content": "すること"}])
+
+    assert len(kept) == 1
+
+
+def test_prefetch_public_path_keeps_both_rows_that_only_share_characters():
+    provider = _provider(canonical=_shared_character_store(), results=[_working_row(SPACED_TEXT)])
+
+    block = provider.prefetch(SHARED_TEXT)
+
+    assert SHARED_TEXT in block, "the canonical row was dropped by dedup"
+    assert SPACED_TEXT in block, "the ordinary recall result was dropped by dedup"
+
+
+def test_recall_tool_path_keeps_both_rows_that_only_share_characters():
+    provider = _provider(canonical=_shared_character_store(), results=[_working_row(SPACED_TEXT)])
+
+    payload = json.loads(provider._handle_recall({"query": SHARED_TEXT}))
+
+    contents = [row.get("content") for row in payload["results"]]
+    assert SHARED_TEXT in contents, "the canonical row was dropped by dedup"
+    assert SPACED_TEXT in contents, "the ordinary recall result was dropped by dedup"
