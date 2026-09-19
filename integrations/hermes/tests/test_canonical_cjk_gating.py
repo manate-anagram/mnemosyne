@@ -426,6 +426,87 @@ def test_latin_canonical_matching_is_unchanged(path_name, path):
 # dropped before injection / before the recall result list was returned.
 
 
+# ---------------------------------------------------------------------------
+# Review round on #975 (dplush, CHANGES_REQUESTED): iteration marks, bridge
+# units inside function-word spans, and the Japanese middle dot.
+# ---------------------------------------------------------------------------
+
+def _rows_store(rows):
+    return FakeCanonicalStore([
+        {
+            "body": body,
+            "category": category,
+            "name": name,
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        for category, name, body in rows
+    ])
+
+
+def test_iteration_mark_folds_into_one_unit():
+    assert _prefetch_lexical_units("佐々木") == {"佐木"}
+    assert _prefetch_lexical_units("佐々野") == {"佐野"}
+    assert not (_prefetch_lexical_units("佐々木") & _prefetch_lexical_units("佐々野"))
+
+
+@pytest.mark.parametrize("path_name,path", CANONICAL_PATHS, ids=CANONICAL_PATH_IDS)
+def test_iteration_mark_does_not_collapse_two_names(path_name, path):
+    store = _rows_store([
+        ("identity", "sasaki", "佐々木"),
+        ("identity", "sasano", "佐々野"),
+    ])
+
+    # Before the fix both queries produced one character per unit, so 佐々野
+    # shared 佐 with 佐々木 and reached the slot.
+    assert [row.get("canonical_name") for row in path(store, "default", "佐々木")] == ["sasaki"]
+    assert [row.get("canonical_name") for row in path(store, "default", "佐々野")] == ["sasano"]
+
+
+@pytest.mark.parametrize("path_name,path", CANONICAL_PATHS, ids=CANONICAL_PATH_IDS)
+def test_iteration_mark_query_does_not_reach_a_longer_sentence(path_name, path):
+    store = _rows_store([("identity", "family_name", "利用者の姓は「佐々木」である。")])
+
+    assert path(store, "default", "佐々野") == []
+    assert path(store, "default", "佐々野の予定は？") == []
+    assert [row.get("canonical_name") for row in path(store, "default", "佐々木")] == ["family_name"]
+
+
+def test_function_word_spans_leave_no_bridge_units():
+    assert _prefetch_lexical_units("すること") == set()
+
+    units = _prefetch_lexical_units("確認すること")
+    assert "るこ" not in units
+    assert "確認" in units
+
+
+@pytest.mark.parametrize("path_name,path", CANONICAL_PATHS, ids=CANONICAL_PATH_IDS)
+def test_bridge_units_inside_function_words_do_not_match_unrelated_slots(path_name, path):
+    store = _rows_store([
+        ("procedure", "backup", "バックアップを確認すること。"),
+        ("procedure", "booking", "予約は受付で行うこと。"),
+    ])
+
+    matched = [row.get("canonical_name") for row in path(store, "default", "予約すること")]
+    assert matched == ["booking"]
+
+
+def test_middle_dot_separates_cjk_runs():
+    assert _prefetch_lexical_units("猫・犬") == {"猫", "犬"}
+    assert _prefetch_lexical_units("猫・犬") == _prefetch_lexical_units("猫、犬")
+
+
+@pytest.mark.parametrize("path_name,path", CANONICAL_PATHS, ids=CANONICAL_PATH_IDS)
+def test_middle_dot_separated_entry_matches_as_separate_runs(path_name, path):
+    store = _rows_store([
+        ("preference", "pets", "猫・犬"),
+        ("preference", "birds", "鳥・犬"),
+    ])
+
+    # Before the fix 猫・犬 produced {"猫・", "・犬"}, so neither entry matched.
+    assert [row.get("canonical_name") for row in path(store, "default", "猫")] == ["pets"]
+    assert [row.get("canonical_name") for row in path(store, "default", "鳥")] == ["birds"]
+
+
 def _shared_character_store():
     return FakeCanonicalStore([
         {

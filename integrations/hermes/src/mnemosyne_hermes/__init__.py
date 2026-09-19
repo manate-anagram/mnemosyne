@@ -413,7 +413,12 @@ def _prefetch_tokens(content: str) -> Set[str]:
     return tokens
 
 
-_PREFETCH_CJK_UNIT_RE = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]+")
+# U+3005 (々, ideographic iteration mark) sits inside the run so a name such as
+# 佐々木 is never split into single-character units, while U+30FB (・, katakana
+# middle dot) deliberately stays outside it because it separates entries: 猫・犬
+# must yield the same units as 猫、犬 (review: dplush on #975).
+_PREFETCH_CJK_UNIT_RE = re.compile(r"[\u3005\u3040-\u30fa\u30fc-\u30ff\u4e00-\u9fff\uac00-\ud7af]+")
+_PREFETCH_CJK_ITERATION_MARK = "\u3005"
 
 
 # Function-word CJK 2-grams carry no topical evidence. Without this filter a
@@ -455,6 +460,38 @@ def _prefetch_cjk_stop_units() -> Set[str]:
     return configured | extras
 
 
+def _prefetch_cjk_run_units(run: str, stop_units: Set[str]) -> Set[str]:
+    """Reduce one CJK run to the lexical units used for slot matching.
+
+    A run longer than one character becomes overlapping 2-grams; that is what
+    keeps unrelated single-source-of-truth slots out of the context (#971). Two
+    further rules come from review on #975:
+
+    * the ideographic iteration mark is folded away, so 佐々木 compares as 佐木
+      and 佐々野 as 佐野 -- different names no longer share a prefix unit;
+    * a 2-gram that lies *entirely inside* configured function-word spans is
+      dropped even when it is not listed itself. Filtering only the listed units
+      left bridge evidence such as るこ from すること, which satisfied the
+      single-token exception and injected unrelated facts.
+    """
+    run = run.replace(_PREFETCH_CJK_ITERATION_MARK, "")
+    if not run:
+        return set()
+    if len(run) == 1:
+        return {run}
+    covered: Set[int] = set()
+    for index in range(len(run) - 1):
+        if run[index:index + 2] in stop_units:
+            covered.update((index, index + 1))
+    units: Set[str] = set()
+    for index in range(len(run) - 1):
+        unit = run[index:index + 2]
+        if unit in stop_units or (index in covered and index + 1 in covered):
+            continue
+        units.add(unit)
+    return units
+
+
 def _prefetch_lexical_units(content: str) -> Set[str]:
     """Return lexical evidence units used for canonical slot matching.
 
@@ -471,14 +508,7 @@ def _prefetch_lexical_units(content: str) -> Set[str]:
     stop_units = _prefetch_cjk_stop_units()
     units: Set[str] = set()
     for match in _PREFETCH_CJK_UNIT_RE.finditer(c):
-        run = match.group(0)
-        if len(run) == 1:
-            units.add(run)
-            continue
-        units.update(
-            unit for unit in (run[i:i + 2] for i in range(len(run) - 1))
-            if unit not in stop_units
-        )
+        units.update(_prefetch_cjk_run_units(match.group(0), stop_units))
     # Word tokens come from the non-CJK remainder only. _PREFETCH_TOKEN_RE uses
     # Unicode \\w, so an unread run would also arrive as one whole-run token that
     # bypasses the stop-unit filter whenever a query and a row share an
