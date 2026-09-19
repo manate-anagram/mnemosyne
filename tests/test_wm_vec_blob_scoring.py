@@ -271,6 +271,52 @@ def test_unscorable_int8_candidates_fall_back_to_the_exact_scan(temp_db, monkeyp
 
 
 @requires_vec
+def test_mixed_scorable_candidates_keep_every_row_and_score(temp_db, monkeypatch):
+    """A partially scorable int8 result set must not lose rows or scores.
+
+    `_wm_vec_search_sqlite` abandons the whole vector arm as soon as one
+    candidate has no usable blob, handing the complete candidate set to the
+    compatibility scan. This pins that invariant for a *mixed* set: two
+    candidates are scored from their stored bytes, exactly one abstains, and all
+    three rows still come back with their exact cosines (review: dplush on #987).
+    """
+    beam = BeamMemory(session_id="wm-vec-mixed", db_path=temp_db)
+    if not beam_module._wm_vec_available(beam.conn):
+        pytest.skip("sqlite-vec vec_working table unavailable")
+    query = _blob_fixture(beam, "wm-vec-mixed")
+    angled_blob = bytes(beam.conn.execute(
+        "SELECT vw.embedding FROM vec_working vw "
+        "JOIN working_memory wm ON wm.rowid = vw.rowid WHERE wm.id = ?",
+        ("wm-angled",),
+    ).fetchone()[0])
+
+    original = beam_module._wm_vec_row_sim
+    scored = []
+    abstained = []
+
+    def mixed(distance, vec_type, query_blob, row_blob):
+        if row_blob == angled_blob:
+            abstained.append(row_blob)
+            return None
+        sim = original(distance, vec_type, query_blob, row_blob)
+        scored.append(sim)
+        return sim
+
+    monkeypatch.setattr(beam_module, "_wm_vec_row_sim", mixed)
+    results = _wm_vec_search(beam.conn, query, k=3)
+    sims = {r["id"]: r["sim"] for r in results}
+
+    assert len(abstained) == 1, abstained
+    # The arm stops at the first abstention because it hands the whole set to
+    # the compatibility scan; anything it scored before that is a real cosine.
+    assert scored and all(s is not None for s in scored), scored
+    assert set(sims) == {"wm-same", "wm-angled", "wm-orthogonal"}
+    assert sims["wm-same"] == pytest.approx(1.0, abs=0.05)
+    assert sims["wm-angled"] == pytest.approx(0.8, abs=0.1)
+    assert sims["wm-orthogonal"] == pytest.approx(0.0, abs=0.1)
+
+
+@requires_vec
 def test_recall_ranks_the_gold_row_above_a_distractor(temp_db, monkeypatch):
     """`BeamMemory.recall()`: the dense voice must separate gold from distractor.
 
