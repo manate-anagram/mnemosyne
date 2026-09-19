@@ -677,7 +677,15 @@ def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72
     kept: List[Dict[str, Any]] = []
     kept_tokens: List[Set[str]] = []
     for row in rows:
-        tokens = _prefetch_tokens(row.get("content", ""))
+        # Compare lexical units, never the per-character token set: a canonical
+        # row ("部署安排" -> 部署/署安/安排) and a spaced result ("部 署 安 排" ->
+        # 部/署/安/排) share every character while carrying different evidence,
+        # so a character-set comparison silently dropped one of the two rows
+        # (review: coderabbitai on #975). A row whose units are all function
+        # words keeps its previous character/word signature, so it still
+        # collapses against an equivalent row instead of being dropped for
+        # having no signature at all.
+        tokens = _prefetch_lexical_units(row.get("content", "")) or _prefetch_tokens(row.get("content", ""))
         if not tokens:
             continue
         duplicate = False
