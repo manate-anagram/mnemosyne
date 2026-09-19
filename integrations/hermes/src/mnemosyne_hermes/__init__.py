@@ -703,6 +703,31 @@ def _prefetch_has_distinctive_lexical_evidence(query: str, content: str) -> bool
     )
 
 
+def _prefetch_dedup_signature(content: str) -> Set[str]:
+    """Lexical signature used to collapse duplicate prefetch rows.
+
+    Deduplication is ordinary-result behaviour, so it must not follow the
+    canonical CJK stop-unit settings: those knobs are operator controls for slot
+    matching, and letting them reshape ordinary signatures made the same recall
+    pair collapse differently after configuration (review: coderabbitai on
+    #975). CJK runs are still reduced to 2-grams, which is what stops a
+    canonical row ("部署安排") and a spaced ordinary result ("部 署 安 排") from
+    being collapsed merely because they share characters.
+    """
+    c = _strip_prefetch_prefix(content).lower()
+    units: Set[str] = set()
+    for match in _PREFETCH_CJK_UNIT_RE.finditer(c):
+        run = match.group(0).replace(_PREFETCH_CJK_ITERATION_MARK, "")
+        if not run:
+            continue
+        if len(run) == 1:
+            units.add(run)
+            continue
+        units.update(run[index:index + 2] for index in range(len(run) - 1))
+    units |= _prefetch_word_tokens(_PREFETCH_CJK_UNIT_RE.sub(" ", c))
+    return units
+
+
 def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72) -> List[Dict[str, Any]]:
     kept: List[Dict[str, Any]] = []
     kept_tokens: List[Set[str]] = []
@@ -711,11 +736,11 @@ def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72
         # row ("部署安排" -> 部署/署安/安排) and a spaced result ("部 署 安 排" ->
         # 部/署/安/排) share every character while carrying different evidence,
         # so a character-set comparison silently dropped one of the two rows
-        # (review: coderabbitai on #975). A row whose units are all function
-        # words keeps its previous character/word signature, so it still
-        # collapses against an equivalent row instead of being dropped for
-        # having no signature at all.
-        tokens = _prefetch_lexical_units(row.get("content", "")) or _prefetch_tokens(row.get("content", ""))
+        # (review: coderabbitai on #975). The signature deliberately ignores the
+        # canonical stop-unit configuration, so tuning slot matching cannot
+        # change how ordinary rows deduplicate; rows with no signature at all
+        # keep the previous character/word signature instead of being dropped.
+        tokens = _prefetch_dedup_signature(row.get("content", "")) or _prefetch_tokens(row.get("content", ""))
         if not tokens:
             continue
         duplicate = False

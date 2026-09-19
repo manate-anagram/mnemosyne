@@ -490,6 +490,64 @@ def test_bridge_units_inside_function_words_do_not_match_unrelated_slots(path_na
     assert matched == ["booking"]
 
 
+def test_dedup_signature_ignores_the_cjk_stop_unit_configuration(monkeypatch):
+    """Canonical stop units tune slot matching, not ordinary deduplication.
+
+    With ``部署`` configured as a stop unit the canonical units for 部署計画
+    change (部署 disappears), which is the documented contract. The dedup
+    signature must stay identical, so the same pair still collapses to one row
+    (review: coderabbitai on #975).
+    """
+
+    rows = [{"content": "部署"}, {"content": "部署計画"}]
+    assert len(_semantic_dedup_prefetch([dict(row) for row in rows])) == 1
+
+    monkeypatch.setenv("MNEMOSYNE_PREFETCH_CJK_STOP_UNITS", "部署")
+
+    assert _prefetch_lexical_units("部署計画") == {"署計", "計画"}, "canonical units must follow the config"
+    assert len(_semantic_dedup_prefetch([dict(row) for row in rows])) == 1, "ordinary dedup must not"
+
+
+BACKUP_A = "バックアップの保存先は外付けディスク。"
+BACKUP_B = "バックアップの保存先は外付けディスクとする。"
+
+
+def test_prefetch_dedup_ignores_the_cjk_stop_unit_configuration(monkeypatch):
+    """The public prefetch path deduplicates ordinary rows the same way."""
+
+    monkeypatch.setenv("MNEMOSYNE_PREFETCH_CJK_STOP_UNITS", "保存先")
+    provider = _provider(results=[_working_row(BACKUP_A), _working_row(BACKUP_B)])
+
+    block = provider.prefetch("バックアップの保存先は？")
+
+    assert BACKUP_A in block, "the kept ordinary row must still be injected"
+    assert BACKUP_B not in block, "a duplicate ordinary row must still be dropped"
+
+
+def test_recall_dedup_ignores_the_cjk_stop_unit_configuration(monkeypatch):
+    """mnemosyne_recall merges canonical rows without changing ordinary dedup."""
+
+    monkeypatch.setenv("MNEMOSYNE_PREFETCH_CJK_STOP_UNITS", "保存先")
+    canonical = FakeCanonicalStore([
+        {
+            "body": "週次のバックアップ手順を実行し、保存先は外付けディスクとする。",
+            "category": "procedure",
+            "name": "backup",
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+    ])
+    server_a = "社内の共有サーバーは業務時間内のみ稼働する。"
+    server_b = "社内の共有サーバーは業務時間内のみ稼働する運用です。"
+    provider = _provider(canonical=canonical, results=[_working_row(server_a), _working_row(server_b)])
+
+    payload = json.loads(provider._handle_recall({"query": "バックアップの保存先は？"}))
+    contents = [row.get("content") for row in payload["results"]]
+
+    assert canonical._rows[0]["body"] in contents, "the canonical row must still be merged"
+    assert server_a in contents, "the kept ordinary row must still be returned"
+    assert server_b not in contents, "a duplicate ordinary row must still be dropped"
+
+
 def test_middle_dot_separates_cjk_runs():
     assert _prefetch_lexical_units("猫・犬") == {"猫", "犬"}
     assert _prefetch_lexical_units("猫・犬") == _prefetch_lexical_units("猫、犬")
