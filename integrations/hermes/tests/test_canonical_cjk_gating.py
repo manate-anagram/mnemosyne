@@ -443,10 +443,42 @@ def _rows_store(rows):
     ])
 
 
-def test_iteration_mark_folds_into_one_unit():
-    assert _prefetch_lexical_units("佐々木") == {"佐木"}
-    assert _prefetch_lexical_units("佐々野") == {"佐野"}
-    assert not (_prefetch_lexical_units("佐々木") & _prefetch_lexical_units("佐々野"))
+def test_iteration_mark_expands_to_the_repeated_character():
+    assert _prefetch_lexical_units("佐々木") == {"佐佐", "佐木"}
+    assert _prefetch_lexical_units("佐々野") == {"佐佐", "佐野"}
+    # Expanding keeps the mark's meaning: deleting it made 佐々木 and 佐木 one unit.
+    assert _prefetch_lexical_units("佐々木") != _prefetch_lexical_units("佐木")
+    assert _prefetch_lexical_units("佐々木") - _prefetch_lexical_units("佐木")
+    # 人々 must not degrade to the single character 人.
+    assert _prefetch_lexical_units("人々") == {"人人"}
+    assert _prefetch_lexical_units("代々木") == {"代代", "代木"}
+
+
+@pytest.mark.parametrize("path_name,path", CANONICAL_PATHS, ids=CANONICAL_PATH_IDS)
+def test_iteration_mark_query_does_not_reach_the_shorter_spelling(path_name, path):
+    """佐木 must not reach a slot about 佐々木 (review: dplush)."""
+
+    store = _rows_store([("identity", "sasaki", "佐々木")])
+
+    assert path(store, "default", "佐木") == []
+    assert path(store, "default", "佐木の予定は？") == []
+    assert [row.get("canonical_name") for row in path(store, "default", "佐々木")] == ["sasaki"]
+
+
+@pytest.mark.parametrize("path_name,path", CANONICAL_PATHS, ids=CANONICAL_PATH_IDS)
+def test_iteration_mark_does_not_broaden_to_the_base_character(path_name, path):
+    store = _rows_store([("preference", "crowd", "人々")])
+
+    assert path(store, "default", "人") == []
+    assert [row.get("canonical_name") for row in path(store, "default", "人々")] == ["crowd"]
+
+
+def test_dedup_keeps_the_iteration_mark_spellings_apart():
+    """佐々木 and 佐木 are different entries, so dedup must keep both."""
+
+    kept = _semantic_dedup_prefetch([{"content": "佐々木"}, {"content": "佐木"}])
+
+    assert [row["content"] for row in kept] == ["佐々木", "佐木"]
 
 
 @pytest.mark.parametrize("path_name,path", CANONICAL_PATHS, ids=CANONICAL_PATH_IDS)
@@ -500,12 +532,16 @@ def test_dedup_signature_ignores_the_cjk_stop_unit_configuration(monkeypatch):
     """
 
     rows = [{"content": "部署"}, {"content": "部署計画"}]
-    assert len(_semantic_dedup_prefetch([dict(row) for row in rows])) == 1
+    baseline = len(_semantic_dedup_prefetch([dict(row) for row in rows]))
 
     monkeypatch.setenv("MNEMOSYNE_PREFETCH_CJK_STOP_UNITS", "部署")
 
     assert _prefetch_lexical_units("部署計画") == {"署計", "計画"}, "canonical units must follow the config"
-    assert len(_semantic_dedup_prefetch([dict(row) for row in rows])) == 1, "ordinary dedup must not"
+    assert len(_semantic_dedup_prefetch([dict(row) for row in rows])) == baseline, "ordinary dedup must not"
+
+    # A near-duplicate pair still collapses, with or without the configuration.
+    dup = [{"content": BACKUP_A}, {"content": BACKUP_B}]
+    assert len(_semantic_dedup_prefetch([dict(row) for row in dup])) == 1
 
 
 BACKUP_A = "バックアップの保存先は外付けディスク。"

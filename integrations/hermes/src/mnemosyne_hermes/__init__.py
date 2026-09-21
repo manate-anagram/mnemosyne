@@ -533,6 +533,25 @@ def _prefetch_cjk_stop_units() -> Set[str]:
     return configured | extras
 
 
+def _prefetch_expand_cjk_iteration_marks(run: str) -> str:
+    """Expand the ideographic iteration mark into the character it repeats.
+
+    Deleting the mark collapsed distinct text: ``佐々木`` and ``佐木`` produced the
+    same unit ``佐木``, so a slot about ``佐々木`` matched the query ``佐木``, and
+    ``人々`` degraded to the single character ``人``, broadening matches further.
+    Expanding keeps the repetition: ``佐々木`` -> ``佐佐木``, ``人々`` -> ``人人``.
+    A mark with nothing to repeat is dropped (review: dplush on #975).
+    """
+    expanded: List[str] = []
+    for char in run:
+        if char == _PREFETCH_CJK_ITERATION_MARK:
+            if expanded:
+                expanded.append(expanded[-1])
+            continue
+        expanded.append(char)
+    return "".join(expanded)
+
+
 def _prefetch_cjk_run_units(run: str, stop_units: Set[str]) -> Set[str]:
     """Reduce one CJK run to the lexical units used for slot matching.
 
@@ -540,14 +559,14 @@ def _prefetch_cjk_run_units(run: str, stop_units: Set[str]) -> Set[str]:
     keeps unrelated single-source-of-truth slots out of the context (#971). Two
     further rules come from review on #975:
 
-    * the ideographic iteration mark is folded away, so 佐々木 compares as 佐木
-      and 佐々野 as 佐野 -- different names no longer share a prefix unit;
+    * the iteration mark is expanded into the repeated character, so 佐々木
+      compares as 佐佐木 while 佐木 stays a different unit;
     * a 2-gram that lies *entirely inside* configured function-word spans is
       dropped even when it is not listed itself. Filtering only the listed units
       left bridge evidence such as るこ from すること, which satisfied the
       single-token exception and injected unrelated facts.
     """
-    run = run.replace(_PREFETCH_CJK_ITERATION_MARK, "")
+    run = _prefetch_expand_cjk_iteration_marks(run)
     if not run:
         return set()
     if len(run) == 1:
@@ -563,6 +582,56 @@ def _prefetch_cjk_run_units(run: str, stop_units: Set[str]) -> Set[str]:
             continue
         units.add(unit)
     return units
+
+
+def _prefetch_cjk_short_run_units(content: str) -> Set[str]:
+    """Units that come from a CJK run of three characters or fewer.
+
+    A single shared token is weak evidence when the query's own run is short:
+    the queries 佐木 and 佐々野 each share exactly one 2-gram with a slot about
+    佐々木, purely because the names share a prefix (review: dplush on #975). Such
+    a token therefore only admits a one-token match when it is an entire run of
+    the row -- the 猫 of 猫・犬 -- while token evidence from longer query runs is
+    unchanged, which is what keeps the short Chinese question from #971 matching
+    on its single topical unit.
+    """
+    c = _strip_prefetch_prefix(content).lower()
+    stop_units = _prefetch_cjk_stop_units()
+    weak: Set[str] = set()
+    for match in _PREFETCH_CJK_UNIT_RE.finditer(c):
+        run = _prefetch_expand_cjk_iteration_marks(match.group(0))
+        if not run or len(run) > 3:
+            continue
+        if len(run) == 1:
+            weak.add(run)
+            continue
+        weak.update(
+            run[index:index + 2]
+            for index in range(len(run) - 1)
+            if run[index:index + 2] not in stop_units
+        )
+    return weak
+
+
+def _prefetch_cjk_whole_run_units(content: str) -> Set[str]:
+    """CJK runs that are themselves a single lexical unit.
+
+    The single-token exception may only admit a one-unit query when the shared
+    token is an entire run of the row -- an entry such as 猫 in 猫・犬 -- and not
+    when it is a fragment of a longer run, which is what made the query 佐木
+    reach a slot about 佐々木 (review: dplush on #975).
+    """
+    c = _strip_prefetch_prefix(content).lower()
+    stop_units = _prefetch_cjk_stop_units()
+    whole: Set[str] = set()
+    for match in _PREFETCH_CJK_UNIT_RE.finditer(c):
+        run = _prefetch_expand_cjk_iteration_marks(match.group(0))
+        if not run or len(run) > 2:
+            continue
+        if len(run) == 2 and run in stop_units:
+            continue
+        whole.add(run)
+    return whole
 
 
 def _prefetch_lexical_units(content: str) -> Set[str]:
@@ -595,6 +664,7 @@ def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int 
     query_tokens = _prefetch_lexical_units(query)
     if not query_tokens:
         return []
+    weak_query_tokens = _prefetch_cjk_short_run_units(query)
     try:
         rows = store.list(owner_id)
     except Exception:
@@ -612,6 +682,12 @@ def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int 
             continue
         coverage = len(overlap) / max(len(query_tokens), 1)
         distinctive_coverage = len(distinctive_overlap) / max(len(query_tokens - generic_tokens), 1)
+        if len(distinctive_overlap) == 1:
+            only_token = next(iter(distinctive_overlap))
+            if only_token in weak_query_tokens and only_token not in _prefetch_cjk_whole_run_units(body):
+                # A single token shared through a short query run is not
+                # distinctive evidence unless it is a whole run of the row.
+                continue
         if len(distinctive_overlap) < 2 and max(coverage, distinctive_coverage) < 0.30:
             continue
         score = min(1.0, 0.72 + coverage * 0.24 + min(len(overlap), 3) * 0.03)
@@ -650,7 +726,9 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
     except Exception:
         return []
     generic_tokens = _prefetch_canonical_generic_tokens()
+    weak_query_tokens = _prefetch_cjk_short_run_units(query)
     tokenized_rows: List[tuple[Dict[str, Any], str, Set[str]]] = []
+    whole_run_units_by_row: Dict[int, Set[str]] = {}
     token_document_frequency: Dict[str, int] = {}
     for row in rows:
         body = str(row.get("body") or "").strip()
@@ -661,6 +739,7 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
         # them as topical evidence made generic identity slots inject into
         # unrelated professional-identity questions.
         row_tokens = _prefetch_lexical_units(body)
+        whole_run_units_by_row[id(row)] = _prefetch_cjk_whole_run_units(body)
         tokenized_rows.append((row, body, row_tokens))
         for token in row_tokens - generic_tokens:
             token_document_frequency[token] = token_document_frequency.get(token, 0) + 1
@@ -688,6 +767,10 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
             if (
                 max(coverage, distinctive_coverage) < minimum_coverage
                 or token_document_frequency.get(only_token, 0) > rare_document_frequency
+                or (
+                    only_token in weak_query_tokens
+                    and only_token not in whole_run_units_by_row.get(id(row), set())
+                )
             ):
                 continue
         elif len(distinctive_overlap) < minimum_overlap:
@@ -790,7 +873,7 @@ def _prefetch_dedup_signature(content: str) -> Set[str]:
     c = _strip_prefetch_prefix(content).lower()
     units: Set[str] = set()
     for match in _PREFETCH_CJK_UNIT_RE.finditer(c):
-        run = match.group(0).replace(_PREFETCH_CJK_ITERATION_MARK, "")
+        run = _prefetch_expand_cjk_iteration_marks(match.group(0))
         if not run:
             continue
         if len(run) == 1:
@@ -823,7 +906,10 @@ def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72
                 continue
             jaccard = overlap / max(len(tokens | existing), 1)
             containment = overlap / max(min(len(tokens), len(existing)), 1)
-            if jaccard >= threshold or containment >= 0.86:
+            # A single shared unit is not enough for the containment path: it
+            # would collapse 佐々木 with 佐木 (review: dplush). Two or more shared
+            # units still collapse near-duplicate rows as before.
+            if jaccard >= threshold or (overlap >= 2 and containment >= 0.86):
                 duplicate = True
                 break
         if duplicate:
