@@ -139,15 +139,50 @@ def test_prefetch_keeps_the_rarity_guard(monkeypatch):
     assert _canonical_prefetch_rows(store, "default", "什么时候部署？") == []
 
 
+def test_non_cjk_single_token_body_is_not_a_whole_body_unit():
+    # ``cjk_ngram_size == 2`` is also true for ordinary non-CJK queries, so a bare
+    # ``deploy`` body must not be able to borrow the CJK bypass. The query is long
+    # enough that its coverage stays under the bar, which is the only reason the
+    # bypass would have mattered.
+    query = "how do I deploy this service to production tomorrow?"
+
+    store = FakeCanonicalStore([_row("deploy", category="procedure")])
+    assert _canonical_recall_rows(store, "default", query) == []
+    assert _canonical_prefetch_rows(store, "default", query) == []
+
+
+def test_repeated_cjk_units_are_not_a_whole_body_unit():
+    # Tokenization returns a set, so ``部署 部署`` collapses to one entry and would
+    # claim the bypass without this raw-body check.
+    query = "什么时候部署？"
+
+    store = FakeCanonicalStore([_row("部署 部署", category="task")])
+    assert _canonical_recall_rows(store, "default", query) == []
+    assert _canonical_prefetch_rows(store, "default", query) == []
+
+
+def test_separators_around_one_unit_still_qualify():
+    query = "什么时候部署？"
+
+    store = FakeCanonicalStore([_row("部署。", category="task")])
+    assert _contents(_canonical_recall_rows(store, "default", query)) == ["部署。"]
+    assert _contents(_canonical_prefetch_rows(store, "default", query)) == ["部署。"]
+
+
 def test_whole_body_unit_helper_contract():
     # Imported here (not at module scope) so the behaviour tests above fail on
     # assertions rather than on a collection error when the rule is missing.
     import mnemosyne_hermes as hermes
 
     whole_body_unit = hermes._canonical_whole_body_unit
-    assert whole_body_unit({"部署"}, {"什么", "么时", "部署"}, cjk_ngram_size=2) is True
-    # Two units mean the body carries more evidence than the single shared unit.
-    assert whole_body_unit({"部署", "計画"}, {"部署"}, cjk_ngram_size=2) is False
+    query = {"什么", "么时", "时候", "候部", "部署"}
+    assert whole_body_unit("部署", query, cjk_ngram_size=2) is True
+    assert whole_body_unit("部署。", query, cjk_ngram_size=2) is True
+    # Only separators around one CJK bigram qualify.
+    assert whole_body_unit("部署 部署", query, cjk_ngram_size=2) is False
+    assert whole_body_unit("部署計画", query, cjk_ngram_size=2) is False
+    assert whole_body_unit("deploy", query, cjk_ngram_size=2) is False
+    assert whole_body_unit("部", query, cjk_ngram_size=2) is False
     # The one-character compatibility path has its own contract.
-    assert whole_body_unit({"部"}, {"部"}, cjk_ngram_size=1) is False
-    assert whole_body_unit({"部署"}, {"什么"}, cjk_ngram_size=2) is False
+    assert whole_body_unit("部署", query, cjk_ngram_size=1) is False
+    assert whole_body_unit("部署", {"什么"}, cjk_ngram_size=2) is False

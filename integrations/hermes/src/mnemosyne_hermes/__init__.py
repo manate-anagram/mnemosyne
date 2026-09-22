@@ -642,22 +642,38 @@ def _canonical_iteration_recall_match(query: str, body: str) -> bool:
     )
 
 
+# Separators do not add topical evidence, so a body may wrap its one unit in them.
+_CANONICAL_BODY_SEPARATORS = " \t\r\n\u3000.,;:!?()[]{}<>\"'“”’‘、。，．；：！？（）「」『』【】・…—–~～|/\\*+_-"
+
+
 def _canonical_whole_body_unit(
-    row_tokens: Set[str], query_tokens: Set[str], *, cjk_ngram_size: int
+    body: str, query_tokens: Set[str], *, cjk_ngram_size: int
 ) -> bool:
-    """True when a canonical body is exactly one CJK unit that the query contains.
+    """True when a canonical body is exactly one CJK bigram that the query contains.
 
     A short topical fact such as ``部署`` is answerable from a query like
     ``什么时候部署？``, but the surrounding context keeps the query's coverage of
-    that fact low, so the ordinary evidence rules reject it (#1025). The whole
-    body is that single unit, so there is no room for the coincidental
-    two-character overlap that #971 had to suppress: a long unrelated fact
-    cannot claim this path, because its token set is never a single unit.
+    that fact low, so the ordinary evidence rules reject it (#1025).
+
+    The test is on the raw body, not on the token set: tokenization returns a set,
+    so ``部署 部署`` would otherwise collapse to one entry, and
+    ``cjk_ngram_size == 2`` is also true for ordinary non-CJK queries, so a bare
+    ``deploy`` body would qualify too. Requiring exactly one CJK bigram, with only
+    separators around it, keeps the bypass inside the single-unit case that #1025
+    describes; a long unrelated fact cannot claim it, so the #971 suppression of
+    unrelated slots is untouched.
     """
-    if cjk_ngram_size != 2 or len(row_tokens) != 1:
+    if cjk_ngram_size != 2:
         return False
-    unit = next(iter(row_tokens))
-    return unit in query_tokens
+    normalized = "".join(
+        char for char in _strip_prefetch_prefix(str(body)).lower()
+        if char not in _CANONICAL_BODY_SEPARATORS
+    )
+    if len(normalized) != cjk_ngram_size or not all(
+        _is_prefetch_cjk_char(char) for char in normalized
+    ):
+        return False
+    return normalized in query_tokens
 
 
 def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
@@ -686,7 +702,7 @@ def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int 
         coverage = len(overlap) / max(len(query_tokens), 1)
         distinctive_coverage = len(distinctive_overlap) / max(len(query_tokens - generic_tokens), 1)
         whole_body_unit = _canonical_whole_body_unit(
-            row_tokens, query_tokens, cjk_ngram_size=cjk_ngram_size
+            body, query_tokens, cjk_ngram_size=cjk_ngram_size
         )
         if len(distinctive_overlap) < 2 and not whole_body_unit and max(coverage, distinctive_coverage) < 0.30:
             continue
@@ -761,7 +777,7 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
         coverage = len(overlap) / max(len(query_tokens), 1)
         distinctive_coverage = len(distinctive_overlap) / max(len(query_tokens - generic_tokens), 1)
         whole_body_unit = _canonical_whole_body_unit(
-            row_tokens, query_tokens, cjk_ngram_size=cjk_ngram_size
+            body, query_tokens, cjk_ngram_size=cjk_ngram_size
         )
         if len(distinctive_overlap) == 1:
             only_token = next(iter(distinctive_overlap))
