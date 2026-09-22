@@ -596,7 +596,12 @@ def _canonical_explicit_match_tokens(content: str, *, cjk_ngram_size: int) -> Se
 
 
 def _canonical_iteration_recall_match(query: str, body: str) -> bool:
-    """Require all local iteration-mark evidence to match within one CJK run."""
+    """Require all local iteration-mark evidence to match within one CJK run.
+
+    Guards both canonical paths since #1023: explicit recall and automatic
+    prefetch. The name still says "recall" because that is where it landed in
+    #1022; the predicate itself never looked at the caller.
+    """
     query_runs = _canonical_iteration_runs(query)
     body_runs = _canonical_iteration_runs(body)
     query_anchors = [anchors for _raw_tokens, _tokens, anchors in query_runs if anchors]
@@ -776,6 +781,12 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
         overlap = query_tokens & row_tokens
         distinctive_overlap = overlap - generic_tokens
         if not distinctive_overlap:
+            continue
+        # #1023: the same run-local iteration-mark predicate that guards explicit
+        # recall. Without it a query such as `佐々野` could still inject the
+        # unrelated sibling `佐々木` here, which is the worse of the two paths
+        # because prefetch content is written into the prompt unasked.
+        if not _canonical_iteration_recall_match(query, body):
             continue
         # One distinctive token can be enough for canonical slots such as
         # profile URLs; broad queries need a little more coverage. Generic
