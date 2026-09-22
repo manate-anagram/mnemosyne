@@ -642,6 +642,24 @@ def _canonical_iteration_recall_match(query: str, body: str) -> bool:
     )
 
 
+def _canonical_whole_body_unit(
+    row_tokens: Set[str], query_tokens: Set[str], *, cjk_ngram_size: int
+) -> bool:
+    """True when a canonical body is exactly one CJK unit that the query contains.
+
+    A short topical fact such as ``部署`` is answerable from a query like
+    ``什么时候部署？``, but the surrounding context keeps the query's coverage of
+    that fact low, so the ordinary evidence rules reject it (#1025). The whole
+    body is that single unit, so there is no room for the coincidental
+    two-character overlap that #971 had to suppress: a long unrelated fact
+    cannot claim this path, because its token set is never a single unit.
+    """
+    if cjk_ngram_size != 2 or len(row_tokens) != 1:
+        return False
+    unit = next(iter(row_tokens))
+    return unit in query_tokens
+
+
 def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
     """Return canonical facts using the established explicit-recall contract."""
     cjk_ngram_size = _canonical_cjk_ngram_size(query)
@@ -667,7 +685,10 @@ def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int 
             continue
         coverage = len(overlap) / max(len(query_tokens), 1)
         distinctive_coverage = len(distinctive_overlap) / max(len(query_tokens - generic_tokens), 1)
-        if len(distinctive_overlap) < 2 and max(coverage, distinctive_coverage) < 0.30:
+        whole_body_unit = _canonical_whole_body_unit(
+            row_tokens, query_tokens, cjk_ngram_size=cjk_ngram_size
+        )
+        if len(distinctive_overlap) < 2 and not whole_body_unit and max(coverage, distinctive_coverage) < 0.30:
             continue
         score = min(1.0, 0.72 + coverage * 0.24 + min(len(overlap), 3) * 0.03)
         candidates.append({
@@ -739,12 +760,18 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
         # owner/system words do not count toward the minimum overlap.
         coverage = len(overlap) / max(len(query_tokens), 1)
         distinctive_coverage = len(distinctive_overlap) / max(len(query_tokens - generic_tokens), 1)
+        whole_body_unit = _canonical_whole_body_unit(
+            row_tokens, query_tokens, cjk_ngram_size=cjk_ngram_size
+        )
         if len(distinctive_overlap) == 1:
             only_token = next(iter(distinctive_overlap))
+            # A whole-body unit answers the query by itself, so the coverage bar
+            # does not apply; the rarity guard still does, because this path is
+            # injected into every prompt.
             if (
                 max(coverage, distinctive_coverage) < minimum_coverage
-                or token_document_frequency.get(only_token, 0) > rare_document_frequency
-            ):
+                and not whole_body_unit
+            ) or token_document_frequency.get(only_token, 0) > rare_document_frequency:
                 continue
         elif len(distinctive_overlap) < minimum_overlap:
             continue
