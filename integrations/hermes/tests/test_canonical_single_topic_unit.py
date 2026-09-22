@@ -169,6 +169,23 @@ def test_separators_around_one_unit_still_qualify():
     assert _contents(_canonical_prefetch_rows(store, "default", query)) == ["部署。"]
 
 
+def test_fullwidth_punctuation_around_one_unit_still_qualifies():
+    # The tokenizer drops fullwidth/halfwidth punctuation, so the predicate has to
+    # agree: `部署／` tokenizes to one unit, and without the exemption it would be
+    # unreachable even though nothing else is in the body.
+    query = "什么时候部署？"
+
+    for body in ("部署／", "部署｡"):
+        store = FakeCanonicalStore([_row(body, category="task")])
+        assert _contents(_canonical_recall_rows(store, "default", query)) == [body], body
+        assert _contents(_canonical_prefetch_rows(store, "default", query)) == [body], body
+
+    # Punctuation around two units is still two units.
+    two_units = FakeCanonicalStore([_row("部署／計画", category="task")])
+    assert _canonical_recall_rows(two_units, "default", query) == []
+    assert _canonical_prefetch_rows(two_units, "default", query) == []
+
+
 def test_whole_body_unit_helper_contract():
     # Imported here (not at module scope) so the behaviour tests above fail on
     # assertions rather than on a collection error when the rule is missing.
@@ -178,6 +195,7 @@ def test_whole_body_unit_helper_contract():
     query = {"什么", "么时", "时候", "候部", "部署"}
     assert whole_body_unit("部署", query, cjk_ngram_size=2) is True
     assert whole_body_unit("部署。", query, cjk_ngram_size=2) is True
+    assert whole_body_unit("部署／", query, cjk_ngram_size=2) is True
     # Only separators around one CJK bigram qualify.
     assert whole_body_unit("部署 部署", query, cjk_ngram_size=2) is False
     assert whole_body_unit("部署計画", query, cjk_ngram_size=2) is False

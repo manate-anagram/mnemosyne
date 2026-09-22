@@ -643,7 +643,13 @@ def _canonical_iteration_recall_match(query: str, body: str) -> bool:
 
 
 # Separators do not add topical evidence, so a body may wrap its one unit in them.
-_CANONICAL_BODY_SEPARATORS = " \t\r\n\u3000.,;:!?()[]{}<>\"'“”’‘、。，．；：！？（）「」『』【】・…—–~～|/\\*+_-"
+# Covers the ASCII, ideographic and fullwidth/halfwidth punctuation the tokenizer
+# drops anyway; letters and digits stay evidence, which is what keeps this list
+# from turning into a "anything non-CJK" rule.
+_CANONICAL_BODY_SEPARATORS = (
+    " \t\r\n\u3000.,;:!?()[]{}<>\"'“”’‘、。，．；：！？（）「」『』【】・…—–~～|/\\*+_-"
+    "／｡｢｣､･＼［］｛｝〈〉《》"
+)
 
 
 def _canonical_whole_body_unit(
