@@ -1907,6 +1907,63 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
     )
 
 
+_LEADING_SQL_COMMENTS_RE = re.compile(
+    r"(?:\s|--[^\r\n]*(?:\r\n|\r|\n|$)|/\*.*?\*/)*", re.DOTALL
+)
+
+
+def _strip_leading_sql_comments(sql):
+    """Return SQL after whitespace and complete leading comments."""
+    if not isinstance(sql, str):
+        return sql
+    return _LEADING_SQL_COMMENTS_RE.sub("", sql, count=1)
+
+
+_SAVEPOINT_STMT_RE = re.compile(
+    r"""^\s*(?P<verb>COMMIT|END|SAVEPOINT|RELEASE|ROLLBACK)\s*"""
+    r"""(?:(?:TRANSACTION|TO|SAVEPOINT)(?:\s+|(?=\s*;|\s*$)))*"""
+    r"""(?:"(?P<dq>[^"]+)"|'(?P<sq>[^']+)'|\[(?P<br>[^\]]+)\]|"""
+    r"""`(?P<bt>[^`]+)`|(?P<bare>[^\s;]+))?""",
+    re.IGNORECASE,
+)
+
+
+class _BeamCursor(sqlite3.Cursor):
+    """Cursor that mirrors savepoint scope for after-commit hooks.
+
+    Same tracker as _BeamConnection.execute(): without it a savepoint
+    rolled back through a cursor would undo a hook's data while the
+    hook stays queued and fires a phantom event on the next commit
+    (see #963). Bookkeeping runs only after the statement succeeds.
+    """
+
+    def execute(self, sql, *args, **kwargs):
+        conn = self.connection
+        track = getattr(conn, "_track_savepoint_statement", None)
+        release_check = getattr(conn, "_release_may_commit", None)
+        # Pre-state must be read before execution: after a RELEASE that
+        # implicitly commits, in_transaction is already False.
+        watching_commit = bool(
+            track is not None
+            and release_check is not None
+            and release_check(sql)
+        )
+        cursor = super().execute(sql, *args, **kwargs)
+        if track is not None:
+            track(sql)
+        if watching_commit and not conn.in_transaction:
+            conn._savepoint_hook_marks.clear()
+            conn._drain_after_commit_hooks()
+        return cursor
+
+    def executescript(self, sql_script):
+        """Drain hooks at SQLite's implicit pre-script commit (see #963)."""
+        conn = self.connection
+        if conn.in_transaction:
+            conn._real_commit()
+        return super().executescript(sql_script)
+
+
 class _BeamConnection(sqlite3.Connection):
     """sqlite3.Connection subclass that supports deferring commits.
 
@@ -1934,6 +1991,19 @@ class _BeamConnection(sqlite3.Connection):
         self._defer_commit = False
         self._savepoint_counter = 0
         self._vec_working_count_cache: Optional[Tuple[int, int, int]] = None
+        # After-commit hooks (see #963): callables fired once, after the
+        # next real commit, then discarded. A rollback discards them
+        # unseen. Lets callers defer side effects (e.g. event emission)
+        # until data is actually durable instead of firing on savepoint
+        # release inside a caller-owned transaction.
+        self._after_commit_hooks: List[Callable[[], None]] = []
+        # Savepoint scope marks for the hook queue (see #963): each entry
+        # is (savepoint name, queue length when taken), maintained by the
+        # execute() override below. A ROLLBACK TO discards hooks queued
+        # inside the rolled-back savepoint; RELEASE keeps them (merged
+        # into the outer scope); full commit()/rollback() resets the
+        # stack. Names are matched case-insensitively, innermost first.
+        self._savepoint_hook_marks: List[Tuple[str, int]] = []
 
     def _next_savepoint_name(self, purpose: str) -> str:
         """Return a connection-local, SQLite-safe savepoint identifier."""
@@ -1943,12 +2013,155 @@ class _BeamConnection(sqlite3.Connection):
     def commit(self) -> None:
         if self._defer_commit:
             return
+        # Drain only when a transaction actually committed: a no-op
+        # commit with nothing open must not fire hooks queued for a
+        # transaction that never materialized.
+        had_transaction = self.in_transaction
         super().commit()
+        if had_transaction:
+            self._savepoint_hook_marks.clear()
+            self._drain_after_commit_hooks()
+
+    def rollback(self) -> None:
+        # Pending hooks describe uncommitted state: a rollback must never
+        # let them fire later, so discard before delegating. Clearing first
+        # is deliberate — if the rollback itself fails the connection is
+        # untrustworthy and queued side effects must not survive it.
+        self._after_commit_hooks.clear()
+        self._savepoint_hook_marks.clear()
+        super().rollback()
+
+    def cursor(self, factory=None):
+        """Return a hook-aware cursor (see _BeamCursor).
+
+        An explicit factory is honored; the default cursor mirrors
+        savepoint scope for after-commit hooks exactly like
+        connection-level execute().
+        """
+        return super().cursor(factory or _BeamCursor)
+
+    def execute(self, sql, *args, **kwargs):
+        """Execute SQL, mirroring savepoint scope for after-commit hooks.
+
+        Raw SAVEPOINT/RELEASE/ROLLBACK statements bypass commit()/
+        rollback(), so without interception a ROLLBACK TO would undo a
+        hook's data while the hook itself stays queued and fires a
+        phantom event on the next commit (see #963). Bookkeeping runs
+        only after the statement succeeds: a failed statement changes
+        neither SQLite state nor our mirror of it.
+
+        Releasing the outermost savepoint implicitly commits (SQLite
+        starts a transaction for a bare SAVEPOINT), so when a RELEASE
+        flips the connection from in-transaction to autocommit the
+        queued hooks describe durable data and are drained — unless
+        commit deferral is active, in which case the deferred
+        finalization drains them.
+        """
+        release_may_commit = self._release_may_commit(sql)
+        cursor = super().execute(sql, *args, **kwargs)
+        self._track_savepoint_statement(sql)
+        if release_may_commit and not self.in_transaction:
+            self._savepoint_hook_marks.clear()
+            self._drain_after_commit_hooks()
+        return cursor
+
+    def executescript(self, sql_script):
+        """Drain hooks at SQLite's implicit pre-script commit (see #963)."""
+        if self.in_transaction:
+            self._real_commit()
+        return super().executescript(sql_script)
+
+    def _release_may_commit(self, sql) -> bool:
+        """True when this RELEASE could implicitly commit (see #963)."""
+        if self._defer_commit or not self.in_transaction or not isinstance(sql, str):
+            return False
+        match = _SAVEPOINT_STMT_RE.match(_strip_leading_sql_comments(sql))
+        return match is not None and match.group("verb").upper() in {
+            "COMMIT",
+            "END",
+            "RELEASE",
+        }
+
+    def _track_savepoint_statement(self, sql) -> None:
+        """Mirror one savepoint statement onto the hook-queue marks.
+
+        Reached from both connection-level execute() and _BeamCursor.
+        Anything bypassing both (e.g. a foreign cursor factory) is
+        invisible here: an untracked name is left alone rather than
+        guessed at (dropping outer hooks would silently lose real
+        events). Duplicate names resolve innermost-first.
+        """
+        sql = _strip_leading_sql_comments(sql)
+        if not isinstance(sql, str):
+            return
+        head = sql.lstrip()[:9].upper()
+        if not (
+            head.startswith("SAVEPOINT")
+            or head.startswith("RELEASE")
+            or head.startswith("ROLLBACK")
+        ):
+            return
+        match = _SAVEPOINT_STMT_RE.match(sql)
+        if match is None:
+            return
+        verb = match.group("verb").upper()
+        name = (
+            match.group("dq")
+            or match.group("sq")
+            or match.group("br")
+            or match.group("bt")
+            or match.group("bare")
+        )
+        if name is None:
+            if verb == "ROLLBACK":
+                # Bare ROLLBACK via raw SQL ends the whole transaction:
+                # same treatment as rollback().
+                self._after_commit_hooks.clear()
+                self._savepoint_hook_marks.clear()
+            return
+        key = name.casefold()
+        marks = self._savepoint_hook_marks
+        if verb == "SAVEPOINT":
+            marks.append((key, len(self._after_commit_hooks)))
+        elif verb == "RELEASE":
+            # Merges the savepoint (and anything nested in it) into the
+            # outer scope: queued hooks survive, marks do not.
+            for i in range(len(marks) - 1, -1, -1):
+                mark_name, _ = marks[i]
+                del marks[i]
+                if mark_name == key:
+                    break
+        else:  # ROLLBACK TO — the savepoint itself stays active.
+            for i in range(len(marks) - 1, -1, -1):
+                mark_name, mark_len = marks[i]
+                if mark_name == key:
+                    del self._after_commit_hooks[mark_len:]
+                    del marks[i + 1 :]
+                    break
+
+    def _drain_after_commit_hooks(self) -> None:
+        """Fire queued after-commit hooks once each; never raises.
+
+        A failing hook is logged and skipped so one bad side effect
+        cannot break the commit path or starve later hooks. The queue is
+        drained before running so a hook registering another hook defers
+        it to the *next* commit instead of recursing.
+        """
+        hooks, self._after_commit_hooks = self._after_commit_hooks, []
+        for hook in hooks:
+            try:
+                hook()
+            except Exception:
+                logger.exception("after-commit hook failed; skipping")
 
     def _real_commit(self) -> None:
         """Force a real commit regardless of the defer flag.
         Used by `_deferred_commits` on successful exit."""
+        had_transaction = self.in_transaction
         super().commit()
+        if had_transaction:
+            self._savepoint_hook_marks.clear()
+            self._drain_after_commit_hooks()
 
 
 @contextlib.contextmanager
@@ -1997,7 +2210,7 @@ def _guarded_transaction(conn: sqlite3.Connection):
 
 
 @contextlib.contextmanager
-def _deferred_commits(conn: sqlite3.Connection):
+def _deferred_commits(conn: sqlite3.Connection, *, immediate: bool = False):
     """Defer nested commits without stealing a caller-owned transaction.
 
     A BEAM-owned batch starts and commits its own transaction.  When a caller
@@ -2015,7 +2228,7 @@ def _deferred_commits(conn: sqlite3.Connection):
     savepoint = conn._next_savepoint_name("deferred_commits")
     previously_deferred = conn._defer_commit
     if owns_transaction:
-        conn.execute("BEGIN")
+        conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
     else:
         conn.execute(f"SAVEPOINT {savepoint}")
     conn._defer_commit = True
@@ -6671,31 +6884,59 @@ class BeamMemory:
 
         return None
 
+    @staticmethod
+    def _delete_unambiguous_memory_children(cursor, memory_id: str) -> None:
+        """Delete child rows after the caller proves no other tier owns the ID.
+
+        ``annotations``, ``memory_embeddings``, and ``gists`` currently carry
+        only ``memory_id``. They cannot distinguish a working parent from an
+        episodic parent when both tiers contain the same ID. Callers must retain
+        those ambiguous rows while another parent survives; guessing ownership
+        here would turn a tier-local forget into cross-tier data loss (#1002).
+        """
+        cursor.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
+        cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+        gists_table = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+        ).fetchone()
+        if gists_table is not None:
+            cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+
     def forget_working(self, memory_id: str) -> bool:
-        """Delete a session-authorized working memory row and its cascade
-        (vector, annotations, embeddings, gists) atomically."""
-        # E6.a: the cascade-delete of annotations must be authorized by the
-        # session-scoped working_memory DELETE. The annotations table has no
-        # session_id column, so an unconditional `DELETE FROM annotations
-        # WHERE memory_id = ?` lets a hostile caller in session B pass a
-        # memory_id from session A and silently wipe session A's annotations
-        # -- adversarial /review found this. The session-scoped working_memory
-        # DELETE is the trust boundary: if it matches a row, the caller is
-        # authorized to delete the row's annotations. If it matches zero
-        # rows (wrong session, or already-forgotten), we skip the cascade.
-        #
-        # Wrapped in an explicit transaction with rollback so a mid-cascade
-        # failure (corrupted table, lock contention, future FK trigger)
-        # rolls back the working_memory DELETE rather than leaving it
-        # uncommitted on the connection for a later unrelated commit to
-        # silently include.
+        """Delete an authorized working row without crossing tier ownership.
+
+        Tier-specific vectors are always safe to remove. Shared child rows are
+        removed only when no episodic parent with the same ID survives.
+        A caller-owned transaction must already hold an immediate write lock so
+        the parent set cannot change between the ownership probe and cascade.
+        """
+        # E6.a: the session-scoped parent DELETE is the authorization boundary.
+        # Child tables have no session_id, so no cascade runs after a miss.
         cursor = self.conn.cursor()
         owns_transaction = not self.conn.in_transaction
         with _guarded_transaction(self.conn):
+            if owns_transaction:
+                # Freeze the parent set before ownership checks. Otherwise a
+                # concurrent same-ID insert can arrive before the cascade.
+                cursor.execute("BEGIN IMMEDIATE")
             authorized_row = cursor.execute(
                 "SELECT rowid FROM working_memory WHERE id = ? AND (session_id = ? OR scope = 'global')",
                 (memory_id, self.session_id),
             ).fetchone()
+            competing_parent = cursor.execute(
+                "SELECT 1 FROM episodic_memory WHERE id = ? LIMIT 1",
+                (memory_id,),
+            ).fetchone()
+            if competing_parent is None:
+                legacy_table = cursor.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'memories'"
+                ).fetchone()
+                if legacy_table is not None:
+                    competing_parent = cursor.execute(
+                        "SELECT 1 FROM memories WHERE id = ? LIMIT 1",
+                        (memory_id,),
+                    ).fetchone()
             if authorized_row is not None and _wm_vec_available(self.conn):
                 cursor.execute("DELETE FROM vec_working WHERE rowid = ?", (int(authorized_row["rowid"]),))
             cursor.execute(
@@ -6703,21 +6944,70 @@ class BeamMemory:
                 (memory_id, self.session_id),
             )
             wm_rows = cursor.rowcount
-            if wm_rows > 0:
-                cursor.execute(
-                    "DELETE FROM annotations WHERE memory_id = ?", (memory_id,)
-                )
-                cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
-                gists_table = cursor.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
-                ).fetchone()
-                if gists_table is not None:
-                    cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+            if wm_rows > 0 and competing_parent is None:
+                self._delete_unambiguous_memory_children(cursor, memory_id)
         forgotten = wm_rows > 0
         if forgotten:
             if owns_transaction:
                 self._invalidate_query_cache_after_commit("forget_working")
             else:
+                self._invalidate_query_cache()
+        return forgotten
+
+    def forget_episodic(self, memory_id: str) -> bool:
+        """Delete an authorized episodic row without crossing tier ownership.
+
+        The session-or-global predicate mirrors ``forget_working``. Shared
+        children are retained whenever a working or legacy parent with the same
+        ID survives because the current schema cannot prove their owning tier.
+        A caller-owned transaction must already hold an immediate write lock so
+        the parent set cannot change between the ownership probe and cascade.
+        """
+        cursor = self.conn.cursor()
+        owns_transaction = not self.conn.in_transaction
+        with _guarded_transaction(self.conn):
+            if owns_transaction:
+                # Keep the ownership probe and cascade under one write lock.
+                cursor.execute("BEGIN IMMEDIATE")
+            authorized_row = cursor.execute(
+                "SELECT rowid FROM episodic_memory "
+                "WHERE id = ? AND (session_id = ? OR scope = 'global')",
+                (memory_id, self.session_id),
+            ).fetchone()
+            competing_parent = cursor.execute(
+                "SELECT 1 FROM working_memory WHERE id = ? LIMIT 1",
+                (memory_id,),
+            ).fetchone()
+            if competing_parent is None:
+                legacy_table = cursor.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'memories'"
+                ).fetchone()
+                if legacy_table is not None:
+                    competing_parent = cursor.execute(
+                        "SELECT 1 FROM memories WHERE id = ? LIMIT 1",
+                        (memory_id,),
+                    ).fetchone()
+            if authorized_row is not None and _vec_available(self.conn):
+                cursor.execute(
+                    "DELETE FROM vec_episodes WHERE rowid = ?",
+                    (int(authorized_row["rowid"]),),
+                )
+            cursor.execute(
+                "DELETE FROM episodic_memory "
+                "WHERE id = ? AND (session_id = ? OR scope = 'global')",
+                (memory_id, self.session_id),
+            )
+            episodic_rows = cursor.rowcount
+            if episodic_rows > 0 and competing_parent is None:
+                self._delete_unambiguous_memory_children(cursor, memory_id)
+        forgotten = episodic_rows > 0
+        if forgotten:
+            if owns_transaction:
+                self._invalidate_query_cache_after_commit("forget_episodic")
+            else:
+                # The deleted row is visible to reads in this transaction.
+                # Invalidate now; rollback can safely leave a cache miss.
                 self._invalidate_query_cache()
         return forgotten
 

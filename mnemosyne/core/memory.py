@@ -726,6 +726,28 @@ class Mnemosyne:
             except Exception:
                 pass
 
+    def _emit_after_commit(self, event_type: str, memory_id: str, **kwargs) -> None:
+        """Emit now, or defer until the caller's transaction commits (see #963).
+
+        When this call owns the transaction it is already committed by the
+        time this runs, so emit immediately (historical behavior). When a
+        caller-owned transaction is still open, emitting now would fire
+        before the caller's commit — a phantom event if they roll back —
+        so queue an after-commit hook on the connection instead. The hook
+        fires on the next real commit and is discarded unseen on rollback,
+        including a ROLLBACK TO a savepoint taken before the hook was
+        queued (the connection mirrors savepoint scope; see #963). On a
+        non-BEAM connection (no hook support) fall back to immediate
+        emission.
+        """
+        conn = self.conn
+        if isinstance(conn, _BeamConnection) and conn.in_transaction:
+            conn._after_commit_hooks.append(
+                lambda: self._emit_wrapper(event_type, memory_id, **kwargs)
+            )
+        else:
+            self._emit_wrapper(event_type, memory_id, **kwargs)
+
     def get_context(self, limit: int = 10) -> List[Dict]:
         """
         Get recent memories from current session for context injection.
@@ -800,8 +822,9 @@ class Mnemosyne:
         return self.beam.get(memory_id)
 
     def forget(self, memory_id: str) -> bool:
-        """Delete a memory by ID from legacy table and working_memory."""
-        with _deferred_commits(self.conn):
+        """Delete a memory by ID from legacy, working, or episodic storage."""
+        emit_invalidation = True
+        with _deferred_commits(self.conn, immediate=True):
             cursor = self.conn.cursor()
             # Authorize from the authoritative BEAM row before deleting either
             # representation. A global row may be removed cross-session, but
@@ -822,13 +845,16 @@ class Mnemosyne:
                     (memory_id, self.session_id),
                 ).fetchone()
                 if legacy_owner is None:
-                    return False
-                cursor.execute(
-                    "DELETE FROM memories WHERE id = ? AND session_id = ?",
-                    (memory_id, self.session_id),
-                )
-                self.conn.commit()
-                result = False
+                    result = self.beam.forget_episodic(memory_id)
+                    emit_invalidation = result
+                else:
+                    cursor.execute(
+                        "DELETE FROM memories WHERE id = ? AND session_id = ?",
+                        (memory_id, self.session_id),
+                    )
+                    self.conn.commit()
+                    result = self.beam.forget_episodic(memory_id)
+                    emit_invalidation = result
             else:
                 cursor.execute(
                     "DELETE FROM memories WHERE id = ? AND session_id = ?",
@@ -836,7 +862,11 @@ class Mnemosyne:
                 )
                 self.conn.commit()
                 result = self.beam.forget_working(memory_id)
-        self._emit_wrapper("MEMORY_INVALIDATED", memory_id)
+        # Emit after _deferred_commits finalizes, and defer past a
+        # caller-owned transaction. A missing/unauthorized episodic row must
+        # not publish a successful invalidation.
+        if emit_invalidation:
+            self._emit_after_commit("MEMORY_INVALIDATED", memory_id)
         return result
 
     def update(self, memory_id: str, content: str = None,
