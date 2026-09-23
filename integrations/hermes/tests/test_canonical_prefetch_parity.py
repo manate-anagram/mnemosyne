@@ -106,6 +106,17 @@ def test_run_boundary_mark_agrees_on_both_paths():
     assert _canonical_prefetch_rows(expanded, "default", "の々木") == []
 
 
+def test_run_start_mark_sharing_a_raw_bigram_is_rejected_on_both_paths():
+    # `々木` has no antecedent, so the mark never expands — but its raw bigram is
+    # also present in `佐々木`, which is where the sibling leak would reappear if
+    # only the expansion anchors were checked. Recall already rejected it; the
+    # prefetch path must agree.
+    store = FakeCanonicalStore([_row("佐々木")])
+
+    assert _canonical_recall_rows(store, "default", "々木") == []
+    assert _canonical_prefetch_rows(store, "default", "々木") == []
+
+
 def test_punctuation_boundary_is_preserved():
     store = FakeCanonicalStore([_row("佐々木。")])
 
