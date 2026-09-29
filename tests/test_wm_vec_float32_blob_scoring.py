@@ -29,6 +29,7 @@ insert path and the search path read the *table's* declared type.
 
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 import tempfile
@@ -384,3 +385,183 @@ def test_recall_separates_gold_from_distractor_on_a_float32_store(temp_db, monke
         "the distance-derived mapping is back"
     )
     assert ids.index("wm-gold") < ids.index("wm-distractor")
+
+
+# ------------------------------------------------- top-k membership (#1080 review)
+
+
+# More rows than the candidate window holds for k=1 (max(k*25, 500)), so the
+# window cannot be read whole.
+_WINDOW_FILLER_ROWS = 520
+
+
+def _clear_vec_store_norm_bit(conn):
+    """Put the store back into the pre-normalization ("non-pure") regime.
+
+    ``_classify_vec_store_regime()`` routes on that format marker, and the vec
+    table is created marked, so a legacy store is simulated by clearing it.
+    """
+    uv = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    conn.execute(f"PRAGMA user_version = {uv & ~beam_module._VEC_NORM_BIT & 0xFFFFFFFF}")
+    conn.commit()
+
+
+def _write_raw_vec_blob(beam, memory_id, values):
+    """Write a row's vec_working blob as-is, bypassing the normalizing writer.
+
+    ``_vec_table_insert()`` normalizes before inserting, so this is the only way
+    a pre-normalization row can exist in the vec table - exactly what the older
+    code left behind.
+    """
+    rowid = beam.conn.execute(
+        "SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0]
+    blob = json.dumps([float(v) for v in values])
+    beam.conn.execute("DELETE FROM vec_working WHERE rowid = ?", (rowid,))
+    beam.conn.execute("INSERT INTO vec_working(rowid, embedding) VALUES (?, ?)", (rowid, blob))
+    beam.conn.commit()
+
+
+def _knn_order(beam, query, k):
+    """The order the distance window alone would return."""
+    return [
+        r[0]
+        for r in beam.conn.execute(
+            "SELECT wm.id FROM vec_working vw JOIN working_memory wm ON wm.rowid = vw.rowid "
+            "WHERE vw.embedding MATCH ? AND k = ? ORDER BY vw.distance",
+            (beam_module._embeddings.serialize(query), k),
+        )
+    ]
+
+
+def _raw_row(values):
+    """A stored vector exactly as given: no normalization.
+
+    The legacy rows under test are non-unit on purpose, so they must not go
+    through ``_query_vector()``.
+    """
+    np = pytest.importorskip("numpy")
+    return np.array(values, dtype=np.float32)
+
+
+def _orthogonal_fillers(dim, start=1):
+    """Rows orthogonal to the query direction, each nearer in L2 than a long row."""
+    rows = []
+    for i in range(_WINDOW_FILLER_ROWS):
+        vec = [0.0] * dim
+        vec[start + i] = 1.0
+        rows.append((f"wm-filler-{i:03d}", f"filler {i}", _raw_row(vec)))
+    return rows
+
+
+def _needs_window_scenario(dim) -> bool:
+    return dim <= _WINDOW_FILLER_ROWS + 1
+
+
+@requires_vec
+def test_top_k_membership_follows_cosine_not_l2_distance(temp_db):
+    """#1080 review: the returned top-k must be the top-k by the reported score.
+
+    ``_wm_vec_search_sqlite()`` reads candidates in L2-distance order, which only
+    agrees with the cosine it reports while the rows are unit-normalized. On a
+    store with a legacy (non-unit) row, truncating in distance order returned the
+    orthogonal unit row (sim 0.0) and dropped the collinear norm-5 row (sim 1.0),
+    even though the exact compatibility scan ranked them the other way round.
+    """
+    dim = beam_module.EMBEDDING_DIM
+    beam = BeamMemory(session_id="wm-f32-membership", db_path=temp_db)
+    if not beam_module._wm_vec_available(beam.conn):
+        pytest.skip("sqlite-vec vec_working table unavailable")
+    _force_float32_vec_working(beam)
+    _clear_vec_store_norm_bit(beam.conn)
+
+    query = _query_vector([1.0] + [0.0] * (dim - 1))
+    orthogonal = _query_vector([0.0, 1.0] + [0.0] * (dim - 2))
+    legacy = [5.0] + [0.0] * (dim - 1)  # norm 5, cosine 1.0, L2 distance 4.0
+    _seed_working_rows(
+        beam,
+        [
+            ("wm-orthogonal", "unrelated unit row", orthogonal),
+            ("wm-collinear", "legacy norm-5 row", _raw_row(legacy)),
+        ],
+        "wm-f32-membership",
+    )
+    # The write path normalizes, so the legacy row is written as-is, the way the
+    # pre-normalization code left it in the vec table.
+    _write_raw_vec_blob(beam, "wm-collinear", legacy)
+
+    # Both rows fit the window (the store is smaller than max(k*25, 500)), so the
+    # only question is the order they are truncated in.
+    results = _wm_vec_search(beam.conn, query, k=1)
+    assert [r["id"] for r in results] == ["wm-collinear"], results
+    assert results[0]["sim"] == pytest.approx(1.0, abs=0.01)
+
+    # The order the window alone would have truncated: the orthogonal unit row is
+    # nearer in L2 (sqrt(2) vs 4.0) even though its cosine is the worse one.
+    assert _knn_order(beam, query, 2) == ["wm-orthogonal", "wm-collinear"]
+
+
+@requires_vec
+def test_bounded_l2_window_abstains_on_a_non_pure_store(temp_db):
+    """#1080 review: a bounded distance window must not silently drop the best match.
+
+    The filler rows are orthogonal to the query and far nearer in L2 than the
+    collinear row, so a 500-row distance window cannot contain the best cosine
+    match at all. The store is not in the normalized format, so the arm abstains
+    and the caller's exact compatibility scan ranks the candidate set.
+    """
+    dim = beam_module.EMBEDDING_DIM
+    if _needs_window_scenario(dim):
+        pytest.skip("embedding dimension too small for this scenario")
+    beam = BeamMemory(session_id="wm-f32-window", db_path=temp_db)
+    if not beam_module._wm_vec_available(beam.conn):
+        pytest.skip("sqlite-vec vec_working table unavailable")
+    _force_float32_vec_working(beam)
+    _clear_vec_store_norm_bit(beam.conn)
+
+    query = _query_vector([1.0] + [0.0] * (dim - 1))
+    legacy = [5.0] + [0.0] * (dim - 1)
+    rows = [("wm-collinear", "legacy norm-5 row", _raw_row(legacy))]
+    rows.extend(_orthogonal_fillers(dim))
+    _seed_working_rows(beam, rows, "wm-f32-window")
+    _write_raw_vec_blob(beam, "wm-collinear", legacy)
+
+    total = beam.conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0]
+    assert total > 500, total  # the window is bounded below the row count
+    # The scenario itself: the best cosine match is outside the 500-row window.
+    window = _knn_order(beam, query, 500)
+    assert len(window) == 500 and "wm-collinear" not in window, window[:5]
+
+    assert beam_module._wm_vec_search_sqlite(beam.conn, query, k=1, where_sql="1=1") == []
+    results = _wm_vec_search(beam.conn, query, k=1)
+    assert [r["id"] for r in results] == ["wm-collinear"], results
+    assert results[0]["sim"] == pytest.approx(1.0, abs=0.01)
+
+
+@requires_vec
+def test_normalized_store_keeps_the_window_fast_path(temp_db):
+    """The format marker still routes a normalized store through the window.
+
+    Only stores that may hold pre-normalization rows abstain; on a "pure" store
+    every row is unit-normalized, distance order is score order, and the bounded
+    window remains exact.
+    """
+    dim = beam_module.EMBEDDING_DIM
+    if _needs_window_scenario(dim):
+        pytest.skip("embedding dimension too small for this scenario")
+    beam = BeamMemory(session_id="wm-f32-pure", db_path=temp_db)
+    if not beam_module._wm_vec_available(beam.conn):
+        pytest.skip("sqlite-vec vec_working table unavailable")
+    _force_float32_vec_working(beam)  # keeps the norm marker written at creation
+    assert beam_module._classify_vec_store_regime(beam.conn, "vec_working") == "pure"
+
+    query = _query_vector([1.0] + [0.0] * (dim - 1))
+    rows = [("wm-best", "closest row", _query_vector([0.8, 0.6] + [0.0] * (dim - 2)))]
+    rows.extend(_orthogonal_fillers(dim))
+    _seed_working_rows(beam, rows, "wm-f32-pure")
+
+    total = beam.conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0]
+    assert total > 500, total  # the window really is bounded
+    results = _wm_vec_search(beam.conn, query, k=3)
+    assert len(results) == 3, results
+    assert results[0]["id"] == "wm-best"

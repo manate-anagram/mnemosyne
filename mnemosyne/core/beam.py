@@ -5202,6 +5202,21 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
         if len(rows) >= k or scan_k >= total_vectors:
             break
         scan_k = min(total_vectors, scan_k * 2)
+    # Membership has to follow the cosine this function reports, not the L2
+    # order the window arrives in. The two only agree while every row is
+    # unit-normalized: a vec0 KNN ranks by L2 distance, so on a store that may
+    # still hold pre-normalization rows a bounded window can omit the best
+    # cosine match entirely. _classify_vec_store_regime() is the format boundary
+    # for exactly that property (a "pure" store is safe for raw-L2 KNN), so on
+    # a store that is not pure and whose rows did not all fit the window,
+    # abstain and let the caller's exact compatibility scan rank the candidate
+    # set - the same conservative routing the episodic path uses - instead of
+    # returning a wrong top-k. Stores in the normalized format (and stores small
+    # enough to be read whole) rank exactly below.
+    if use_blobs and scan_k < total_vectors and (
+        _classify_vec_store_regime(conn, "vec_working") != "pure"
+    ):
+        return []
     results = []
     keys = rows[0].keys() if rows else []
     for row in rows:
@@ -5217,6 +5232,11 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
             # int8/float32 candidate without a usable blob (see _wm_vec_row_sim).
             return []
         results.append({"id": row["id"], "sim": sim})
+    # Re-rank before truncating. The distance-mapped arms are monotone in the
+    # distance, so this is a no-op for them, but the blob-scored arms report an
+    # exact cosine whose order can differ from the window's (legacy non-unit
+    # rows), and the compatibility scan truncates by cosine too.
+    results.sort(key=lambda item: item["sim"], reverse=True)
     return results[:k]
 
 
