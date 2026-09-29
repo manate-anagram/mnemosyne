@@ -744,7 +744,7 @@ def _vec_distance_sim(distance: float, vec_type: "Optional[str]" = None,
 
 
 def _wm_vec_row_sim(distance: float, vec_type: "Optional[str]",
-                    query_blob: "Optional[bytes]" = None,
+                    query_ref: "Optional[Any]" = None,
                     row_blob: "Optional[bytes]" = None) -> "Optional[float]":
     """Similarity for a single working-memory vector candidate.
 
@@ -757,14 +757,36 @@ def _wm_vec_row_sim(distance: float, vec_type: "Optional[str]",
     working-memory dense blend with ordering but no amplitude. The caller then
     routes the candidate set through the exact compatibility scan.
 
-    Every other arm keeps its existing mapping.
+    float32 candidates are scored the same way (``_vec_float32_blob_cosine``): the
+    stored blob is the raw float data, so the exact angle is recoverable without
+    assuming unit norms, and a missing blob abstains like int8.
+
+    The ``bit`` arm keeps its existing mapping.
     """
     if vec_type == "int8":
-        if query_blob and row_blob and len(bytes(query_blob)) == len(bytes(row_blob)):
+        if query_ref and row_blob and len(bytes(query_ref)) == len(bytes(row_blob)):
             # Exact: a genuine 0.0 cosine is a valid answer, so this never
             # falls back to the distance mapping.
-            return _vec_int8_blob_cosine(bytes(query_blob), bytes(row_blob))
+            return _vec_int8_blob_cosine(bytes(query_ref), bytes(row_blob))
         return None
+    if vec_type == "float32":
+        # Same contract as the int8 arm: score the candidate from its stored
+        # bytes (the stored blob IS the float data, so there is no
+        # quantization loss) instead of guessing a scale from the L2
+        # distance. The mapping below assumes unit-norm rows and divides by
+        # the dimension instead of 2, so for float32[1024] it collapses every
+        # candidate into a ~0.9993-0.9996 band: the ordering survives, the
+        # amplitude does not, and the dense blend gets a near-constant term.
+        # Scoring from the blob also stays exact for legacy rows written
+        # before normalization was enforced, where the distance-only
+        # conversion clamps them to 0.
+        #
+        # No blob (or an unreadable one) -> abstain, exactly like int8: the
+        # caller drops the candidate and lets the exact compatibility scan
+        # serve the set rather than reporting a guessed number.
+        if row_blob is None:
+            return None
+        return _vec_float32_blob_cosine(query_ref, bytes(row_blob))
     return max(0.0, min(1.0, 1.0 - (max(float(distance), 0.0) / (2.0 * EMBEDDING_DIM))))
 
 
@@ -5130,21 +5152,27 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
         "bit": "vec_quantize_binary(?)",
         "int8": "vec_quantize_int8(?, 'unit')",
     }.get(vec_type, "?")
-    # int8 rows are scored from their stored bytes (exact cosine), so the query
-    # blob and the vector column are fetched up front. Without them there is no
-    # cosine to report: abstain and let the caller's exact compatibility scan
-    # score the candidate set instead of guessing from the distance.
-    query_blob: "Optional[bytes]" = None
-    use_blobs = vec_type == "int8"
-    if use_blobs:
+    # int8 and float32 rows are scored from their stored bytes (exact cosine),
+    # so the query-side reference and the vector column are fetched up front.
+    # Without them there is no cosine to report: abstain and let the caller's
+    # exact compatibility scan score the candidate set instead of guessing
+    # from the distance.
+    query_ref: "Optional[Any]" = None
+    use_blobs = vec_type in ("int8", "float32")
+    if vec_type == "int8":
         try:
-            query_blob = bytes(conn.execute(
+            query_ref = bytes(conn.execute(
                 "SELECT vec_quantize_int8(?, 'unit')", (emb_json,)
             ).fetchone()[0])
         except Exception:
-            query_blob = None
-        if not query_blob:
+            query_ref = None
+        if not query_ref:
             return []
+    elif vec_type == "float32":
+        # _vec_float32_blob_cosine() takes the query as a vector, not as a
+        # quantized blob: the stored row blob is the raw float data, so there
+        # is nothing to quantize on the query side.
+        query_ref = emb_arr
     blob_col = ", vw.embedding" if use_blobs else ""
     rows = []
     while True:
@@ -5175,9 +5203,9 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
         # memory_embeddings cosine fallback instead of collapsing to ~0 on high
         # dimensions.
         row_blob = row["embedding"] if "embedding" in keys else None
-        sim = _wm_vec_row_sim(distance, vec_type, query_blob, row_blob)
+        sim = _wm_vec_row_sim(distance, vec_type, query_ref, row_blob)
         if sim is None:
-            # int8 candidate without a usable blob (see _wm_vec_row_sim).
+            # int8/float32 candidate without a usable blob (see _wm_vec_row_sim).
             return []
         results.append({"id": row["id"], "sim": sim})
     return results[:k]
