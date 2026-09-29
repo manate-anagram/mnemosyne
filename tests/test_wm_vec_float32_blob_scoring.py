@@ -168,6 +168,34 @@ def test_row_sim_float32_abstains_when_a_blob_is_unavailable():
     assert _wm_vec_row_sim(distance, "float32", query, None) is None
 
 
+def test_row_sim_float32_abstains_on_a_blob_that_cannot_be_a_vector():
+    """A blob of the wrong length must abstain, not score 0.0.
+
+    ``_vec_float32_blob_cosine`` returns 0.0 for a blob it cannot decode into
+    the query's shape, which is indistinguishable from a genuine orthogonal
+    row - so without a length check the arm would silently score an
+    unreadable candidate as unrelated instead of letting the exact
+    compatibility scan serve it (the int8 arm length-checks for the same
+    reason).
+    """
+    dim = beam_module.EMBEDDING_DIM
+    query = _query_vector([1.0] + [0.0] * (dim - 1))
+    distance = 1.116056
+
+    # Not a whole number of float32 values.
+    assert _wm_vec_row_sim(distance, "float32", query, b"\x00\x01\x02") is None
+    # A valid float32 blob, but of the wrong dimension.
+    assert _wm_vec_row_sim(distance, "float32", query, _float32_blob([1.0, 0.0])) is None
+    # No query-side reference to compare against.
+    assert (
+        _wm_vec_row_sim(distance, "float32", None, _float32_blob([1.0] + [0.0] * (dim - 1)))
+        is None
+    )
+    # Control: a correctly shaped pair still scores.
+    ok = _float32_blob([1.0] + [0.0] * (dim - 1))
+    assert _wm_vec_row_sim(0.0, "float32", query, ok) == pytest.approx(1.0, abs=0.01)
+
+
 def test_other_vec_arms_keep_their_mapping():
     """The bit arm is unchanged and the int8 arm is untouched."""
     dim = beam_module.EMBEDDING_DIM

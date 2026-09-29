@@ -783,10 +783,19 @@ def _wm_vec_row_sim(distance: float, vec_type: "Optional[str]",
         #
         # No blob (or an unreadable one) -> abstain, exactly like int8: the
         # caller drops the candidate and lets the exact compatibility scan
-        # serve the set rather than reporting a guessed number.
-        if row_blob is None:
+        # serve the set rather than reporting a guessed number. A blob whose
+        # length cannot be a vector of the query's shape counts as unreadable:
+        # _vec_float32_blob_cosine() reports 0.0 for it, which is
+        # indistinguishable from a genuine orthogonal row, so check the length
+        # here (the int8 arm length-checks for the same reason).
+        if row_blob is None or query_ref is None:
             return None
-        return _vec_float32_blob_cosine(query_ref, bytes(row_blob))
+        row_bytes = bytes(row_blob)
+        import numpy as _np
+        query_arr = _np.asarray(query_ref, dtype=_np.float32)
+        if len(row_bytes) != query_arr.nbytes:
+            return None
+        return _vec_float32_blob_cosine(query_arr, row_bytes)
     return max(0.0, min(1.0, 1.0 - (max(float(distance), 0.0) / (2.0 * EMBEDDING_DIM))))
 
 
