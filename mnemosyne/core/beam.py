@@ -5211,8 +5211,16 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
     # a store that is not pure and whose rows did not all fit the window,
     # abstain and let the caller's exact compatibility scan rank the candidate
     # set - the same conservative routing the episodic path uses - instead of
-    # returning a wrong top-k. Stores in the normalized format (and stores small
-    # enough to be read whole) rank exactly below.
+    # returning a wrong top-k.
+    #
+    # Below, a window that holds every candidate ranks exactly for every
+    # blob-scored arm. For float32, a store in the normalized format also keeps
+    # the bounded window exact, because the marker means its rows are stored
+    # unit-length, so distance order is score order. For int8 it does not: the
+    # marker records only that the write path normalized before quantizing, which
+    # does not make the stored byte norms equal, so a bounded int8 window can
+    # still omit a row with a higher blob cosine. That gap predates this change
+    # and is not addressed here.
     if use_blobs and scan_k < total_vectors and (
         _classify_vec_store_regime(conn, "vec_working") != "pure"
     ):
