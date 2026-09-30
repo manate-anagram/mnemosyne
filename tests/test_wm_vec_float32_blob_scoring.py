@@ -444,18 +444,29 @@ def _raw_row(values):
     return np.array(values, dtype=np.float32)
 
 
-def _orthogonal_fillers(dim, start=1):
-    """Rows orthogonal to the query direction, each nearer in L2 than a long row."""
+def _filler_rows(dim, *, unit=True):
+    """Rows orthogonal to the query, each nearer in L2 than a long row.
+
+    The window is bounded by the number of rows, not by the number of axes, so
+    the fillers reuse the query axis plus one orthogonal axis instead of
+    spreading over one dimension each. That keeps the scenario independent of
+    EMBEDDING_DIM (the CI process runs a 384-dimension model).
+
+    :param unit: emit unit-length fillers, as a normalized store requires.
+    """
     rows = []
     for i in range(_WINDOW_FILLER_ROWS):
         vec = [0.0] * dim
-        vec[start + i] = 1.0
+        # Non-unit fillers are nearer in L2 the smaller their scale, and every
+        # one of them stays nearer than a norm-5 row.
+        vec[1] = 1.0 if unit else 0.5 + (i * 0.001)
         rows.append((f"wm-filler-{i:03d}", f"filler {i}", _raw_row(vec)))
     return rows
 
 
 def _needs_window_scenario(dim) -> bool:
-    return dim <= _WINDOW_FILLER_ROWS + 1
+    # Only the query axis and one orthogonal axis are used.
+    return dim < 2
 
 
 @requires_vec
@@ -522,7 +533,7 @@ def test_bounded_l2_window_abstains_on_a_non_pure_store(temp_db):
     query = _query_vector([1.0] + [0.0] * (dim - 1))
     legacy = [5.0] + [0.0] * (dim - 1)
     rows = [("wm-collinear", "legacy norm-5 row", _raw_row(legacy))]
-    rows.extend(_orthogonal_fillers(dim))
+    rows.extend(_filler_rows(dim, unit=False))
     _seed_working_rows(beam, rows, "wm-f32-window")
     _write_raw_vec_blob(beam, "wm-collinear", legacy)
 
@@ -557,7 +568,7 @@ def test_normalized_store_keeps_the_window_fast_path(temp_db):
 
     query = _query_vector([1.0] + [0.0] * (dim - 1))
     rows = [("wm-best", "closest row", _query_vector([0.8, 0.6] + [0.0] * (dim - 2)))]
-    rows.extend(_orthogonal_fillers(dim))
+    rows.extend(_filler_rows(dim))
     _seed_working_rows(beam, rows, "wm-f32-pure")
 
     total = beam.conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0]
